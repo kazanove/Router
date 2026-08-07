@@ -3,13 +3,30 @@ declare(strict_types=1);
 
 namespace CodeX\Router;
 
-class Builder
+use CodeX\Router\Middleware\Normalizer;
+
+/**
+ * Строитель маршрута.
+ *
+ * Позволяет навешивать middleware и имя маршрута
+ * сразу после регистрации маршрута.
+ */
+final class Builder
 {
+    /**
+     * @var array<int, string>
+     */
     private array $methods;
 
-    public function __construct(private(set) readonly Node $node, array|string $methods)
-    {
-        $this->methods = (array)$methods;
+    public function __construct(
+        private readonly Node $node,
+        array|string $methods,
+        private readonly Collector $collector
+    ) {
+        $this->methods = array_values(array_unique(array_map(
+            static fn (string $method): string => strtoupper($method),
+            (array) $methods
+        )));
     }
 
     public function getNode(): Node
@@ -17,19 +34,27 @@ class Builder
         return $this->node;
     }
 
-    public function middleware(string|array|callable $middleware, array $params = []): self
+    public function middleware(mixed $middleware, array $params = []): self
     {
+        $definitions = Normalizer::normalize($middleware, $params);
+
         foreach ($this->methods as $method) {
-            $this->node->addMiddlewareToHandler($method, $middleware, $params);
+            foreach ($definitions as $definition) {
+                $this->node->addMiddlewareToHandler($method, $definition);
+            }
         }
+
         return $this;
     }
 
     public function name(string $name): self
     {
+        $fullName = $this->collector->registerRouteName($name, $this->node);
+
         foreach ($this->methods as $method) {
-            $this->node->setNameForHandler($method, $name);
+            $this->node->setNameForHandler($method, $fullName);
         }
+
         return $this;
     }
 }

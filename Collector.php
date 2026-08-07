@@ -5,43 +5,74 @@ namespace CodeX\Router;
 
 use Closure;
 use CodeX\Exception\Router;
+use CodeX\Router\Helper\Path;
+use CodeX\Router\Middleware\Definition;
+use CodeX\Router\Middleware\Normalizer;
 
-class Collector
+/**
+ * Сборщик маршрутов.
+ *
+ * Отвечает за:
+ * - добавление маршрутов;
+ * - группы;
+ * - префиксы;
+ * - middleware групп;
+ * - префиксы имён маршрутов;
+ * - реестр именованных маршрутов.
+ */
+final class Collector
 {
     /**
-     * Property Hooks (PHP 8.4): Предоставляем публичный доступ на чтение к корневому узлу,
-     * скрывая внутреннюю реализацию ($rootNode).
+     * Property hook PHP 8.4:
+     * публичный доступ к корню дерева только для чтения.
      */
     public Node $root {
         get => $this->rootNode;
     }
 
-    private array $groupStack = [];
     private Node $rootNode;
+
+    /**
+     * Стек активных групп.
+     *
+     * @var array<int, array{
+     *     prefix: string,
+     *     middleware: array<int, Definition>,
+     *     namePrefix: string
+     * }>
+     */
+    private array $groupStack = [];
+
+    /**
+     * Карта именованных маршрутов.
+     *
+     * @var array<string, string>
+     */
+    private array $namedRoutes = [];
 
     public function __construct()
     {
         $this->rootNode = new Node();
     }
 
-    public function enterGroup(string $prefix, string|array|callable|null $middleware): void
+    public function enterGroup(string $prefix, mixed $middleware, string $namePrefix = ''): void
     {
         $prefix = '/' . trim($prefix, '/');
+
         if ($prefix === '/') {
             $prefix = '';
         }
 
-        $mwList = [];
-        if ($middleware !== null) {
-            $mwList = is_array($middleware) ? $middleware : [$middleware];
-        }
-
-        $this->groupStack[] = ['prefix' => $prefix, 'middleware' => $mwList];
+        $this->groupStack[] = [
+            'prefix' => $prefix,
+            'middleware' => Normalizer::normalize($middleware),
+            'namePrefix' => trim($namePrefix),
+        ];
     }
 
     public function leaveGroup(): void
     {
-        if (!empty($this->groupStack)) {
+        if ($this->groupStack !== []) {
             array_pop($this->groupStack);
         }
     }
@@ -60,81 +91,164 @@ class Collector
 
     public function addRoute(string $method, string $path, callable|array|string $handler): Builder
     {
-        $resolvedHandler = $this->resolveHandler($handler);
-        $fullPath = $this->resolvePath($path);
-        $groupMiddleware = $this->resolveMiddleware();
+        $method = strtoupper(trim($method));
 
-        // Использование вынесенного хелпера для парсинга путей
-        $segments = PathHelper::parse($fullPath);
-        $node = $this->rootNode;
-
-        foreach ($segments as $segment) {
-            $node = $node->addChild($segment);
+        if ($method === '') {
+            throw Router::invalidMethod($method);
         }
 
-        $node->addHandler($method, $resolvedHandler, $groupMiddleware);
+        $this->assertHandler($handler);
 
-        return new Builder($node, $method);
+        $fullPath = $this->resolvePath($path);
+        $groupMiddleware = $this->resolveMiddleware();
+        $segments = Path::parse($fullPath);
+
+        $node = $this->rootNode;
+        $lastIndex = count($segments) - 1;
+
+        foreach ($segments as $index => $segment) {
+            $node = $node->addChild($segment);
+
+            if ($node->isCatchAll && $index !== $lastIndex) {
+                throw Router::catchAllMustBeLast($segment);
+            }
+        }
+
+        $node->setPath($fullPath);
+        $node->addHandler($method, $handler, $groupMiddleware);
+
+        return new Builder($node, [$method], $this);
     }
 
     /**
-     * Безопасное разрешение обработчика.
-     * Избегает преждевременного вызова автозагрузчика (autoloader) и фатальных ошибок
-     * при проверке массивов вида [Controller::class, 'method'].
+     * Регистрирует имя маршрута.
+     *
+     * Возвращает полное имя с учётом активных префиксов групп.
      */
-    private function resolveHandler(callable|array|string $handler): callable|array
+    public function registerRouteName(string $name, Node $node): string
     {
-        if ($handler instanceof Closure) {
-            return $handler;
+        $name = trim($name);
+
+        if ($name === '') {
+            throw Router::invalidRouteName();
         }
 
-        // Поддержка формата [ClassName::class, 'method'] или [$object, 'method']
-        if (is_array($handler) && array_key_exists(0, $handler) && array_key_exists(1, $handler) && count($handler) === 2) {
-            return $handler;
+        $fullName = $this->resolveName($name);
+        $path = $node->getPath() ?? '/';
+
+        if (isset($this->namedRoutes[$fullName]) && $this->namedRoutes[$fullName] !== $path) {
+            throw Router::duplicateRouteName($fullName);
         }
 
-        if (is_string($handler)) {
-            if (str_contains($handler, '@')) {
-                return explode('@', $handler, 2);
-            }
-            if (str_contains($handler, '::')) {
-                return explode('::', $handler, 2);
-            }
-            // Проверка на глобальную функцию (безопасно, без триггера автозагрузчика классов)
-            if (function_exists($handler)) {
-                return $handler;
-            }
+        $this->namedRoutes[$fullName] = $path;
+
+        return $fullName;
+    }
+
+    public function getNamedRoute(string $name): string
+    {
+        if (!isset($this->namedRoutes[$name])) {
+            throw Router::routeNotFound($name);
         }
 
-        throw Router::invalidHandler();
+        return $this->namedRoutes[$name];
+    }
+
+    /**
+     * @return array<string, string>
+     */
+    public function getNamedRoutes(): array
+    {
+        return $this->namedRoutes;
     }
 
     private function resolvePath(string $path): string
     {
-        $prefixes = [];
+        $basePath = '';
+
         foreach ($this->groupStack as $group) {
             if ($group['prefix'] !== '') {
-                $prefixes[] = $group['prefix'];
+                $basePath .= $group['prefix'];
             }
         }
 
-        $basePath = implode('', $prefixes);
         $path = '/' . trim($path, '/');
 
         if ($basePath === '') {
-            return $path;
+            $full = $path;
+        } else {
+            $full = rtrim($basePath, '/') . $path;
         }
-        return rtrim($basePath, '/') . $path;
+
+        if ($full !== '/') {
+            $full = rtrim($full, '/');
+        }
+
+        return $full;
     }
 
+    /**
+     * @return array<int, Definition>
+     */
     private function resolveMiddleware(): array
     {
-        $allMiddleware = [];
+        $all = [];
+
         foreach ($this->groupStack as $group) {
-            foreach ($group['middleware'] as $mw) {
-                $allMiddleware[] = ['class' => $mw, 'params' => []];
+            foreach ($group['middleware'] as $middleware) {
+                $all[] = $middleware;
             }
         }
-        return $allMiddleware;
+
+        return $all;
+    }
+
+    private function resolveName(string $name): string
+    {
+        $prefix = '';
+
+        foreach ($this->groupStack as $group) {
+            $prefix .= $group['namePrefix'];
+        }
+
+        return $prefix . $name;
+    }
+
+    private function assertHandler(callable|array|string $handler): void
+    {
+        if ($handler instanceof Closure) {
+            return;
+        }
+
+        if (is_object($handler)) {
+            return;
+        }
+
+        if (is_array($handler)) {
+            if (
+                array_key_exists(0, $handler)
+                && array_key_exists(1, $handler)
+                && count($handler) === 2
+                && is_string($handler[1])
+                && (is_object($handler[0]) || is_string($handler[0]))
+            ) {
+                return;
+            }
+
+            throw Router::invalidHandler();
+        }
+
+        if (is_string($handler)) {
+            if (
+                function_exists($handler)
+                || class_exists($handler)
+                || str_contains($handler, '@')
+                || str_contains($handler, '::')
+            ) {
+                return;
+            }
+        }
+
+        throw Router::invalidHandler();
     }
 }

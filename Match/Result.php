@@ -4,42 +4,46 @@ declare(strict_types=1);
 namespace CodeX\Router\Match;
 
 /**
- * DTO (Data Transfer Object), содержащий результат работы маршрутизатора.
- * Использование readonly class (PHP 8.2+) гарантирует неизменяемость объекта после создания.
+ * Результат сопоставления маршрута.
  */
-readonly class Result
+final readonly class Result
 {
-    public function __construct(
-        public mixed $handler,
-        public array $middleware,
-        public array $params,
-        public ?string $name = null,
-        public array $allowedMethods = []
-    ) {
+    public function __construct(public Status $status, public mixed $handler = null, public array $middleware = [], public array $params = [], public ?string $name = null, public array $allowedMethods = [], public ?string $matchedPath = null)
+    {
     }
 
-    /**
-     * Проверяет, был ли найден маршрут и обработчик.
-     */
+    public static function found(mixed $handler, array $middleware, array $params, ?string $name, ?string $matchedPath): self
+    {
+        return new self(Status::Found, $handler, $middleware, $params, $name, [], $matchedPath);
+    }
+
+    public static function notFound(): self
+    {
+        return new self(Status::NotFound);
+    }
+
+    public static function methodNotAllowed(array $allowedMethods, array $params = [], ?string $matchedPath = null): self
+    {
+        return new self(Status::MethodNotAllowed, null, [], $params, null, $allowedMethods, $matchedPath);
+    }
+
     public function isFound(): bool
     {
-        return $this->handler !== null;
+        return $this->status === Status::Found;
     }
 
-    /**
-     * Проверяет, существует ли маршрут для данного URL, но не для данного HTTP-метода.
-     * Используется для формирования ответа 405 Method Not Allowed.
-     */
+    public function isNotFound(): bool
+    {
+        return $this->status === Status::NotFound;
+    }
+
     public function isMethodNotAllowed(): bool
     {
-        return $this->handler === null && !empty($this->allowedMethods);
+        return $this->status === Status::MethodNotAllowed;
     }
 
     /**
-     * Формирует строку для HTTP-заголовка 'Allow'.
-     * Требуется по стандарту RFC 7231 при ответе 405 Method Not Allowed.
-     *
-     * @return string Например: 'GET, POST, OPTIONS'
+     * Возвращает значение для HTTP-заголовка Allow.
      */
     public function getAllowedMethodsHeader(): string
     {

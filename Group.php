@@ -3,47 +3,69 @@ declare(strict_types=1);
 
 namespace CodeX\Router;
 
-class Group
+use CodeX\Router\Middleware\Definition;
+use CodeX\Router\Middleware\Normalizer;
+
+/**
+ * Группа маршрутов.
+ *
+ * Поддерживает:
+ * - префиксы пути;
+ * - middleware;
+ * - префиксы имён маршрутов.
+ */
+final class Group
 {
-    private Route $router;
-    private mixed $middlewareList;
+    /**
+     * @var array<int, Definition>
+     */
+    private array $middleware;
+
     private ?string $prefix;
 
+    private string $namePrefix;
+
     public function __construct(
-        Route $router,
-        string|array|callable|null $middleware,
-        ?string $prefix
+        private readonly Route $router,
+        mixed $middleware,
+        ?string $prefix,
+        string $namePrefix = ''
     ) {
-        $this->router = $router;
-        $this->middlewareList = $middleware;
-        $this->prefix = $prefix;
+        $this->middleware = Normalizer::normalize($middleware);
+        $this->prefix = $prefix !== null ? self::normalizePrefix($prefix) : null;
+        $this->namePrefix = $namePrefix;
     }
 
-    public function addMiddleware(string|array|callable $middleware): self
+    public function addMiddleware(mixed $middleware): self
     {
-        if ($this->middlewareList !== null) {
-            $current = is_array($this->middlewareList) ? $this->middlewareList : [$this->middlewareList];
-            $new = is_array($middleware) ? $middleware : [$middleware];
-            $this->middlewareList = array_merge($current, $new);
-        } else {
-            $this->middlewareList = $middleware;
-        }
+        $this->middleware = array_merge(
+            $this->middleware,
+            Normalizer::normalize($middleware)
+        );
 
         return $this;
     }
 
     public function prefix(string $prefix): self
     {
-        $normalized = '/' . trim($prefix, '/');
-        if ($normalized === '/') {
-            $normalized = '';
+        $normalized = self::normalizePrefix($prefix);
+
+        if ($normalized === '') {
+            return $this;
         }
 
-        if ($this->prefix !== null) {
-            $this->prefix = rtrim($this->prefix, '/') . $normalized;
-        } else {
+        if ($this->prefix === null) {
             $this->prefix = $normalized;
+        } else {
+            $this->prefix = rtrim($this->prefix, '/') . $normalized;
         }
+
+        return $this;
+    }
+
+    public function namePrefix(string $namePrefix): self
+    {
+        $this->namePrefix .= $namePrefix;
 
         return $this;
     }
@@ -51,17 +73,27 @@ class Group
     public function group(callable $callback): void
     {
         $collector = $this->router->collector;
-        $prefix = $this->prefix ?? '';
-
         $stackSizeBefore = $collector->getGroupStackSize();
-        $collector->enterGroup($prefix, $this->middlewareList);
 
-        // Конструкция try...finally гарантирует, что стек групп будет восстановлен
-        // даже в случае выброса исключения внутри пользовательского callback.
+        $collector->enterGroup(
+            $this->prefix ?? '',
+            $this->middleware,
+            $this->namePrefix
+        );
+
+        // try/finally гарантирует корректный откат стека групп
+        // даже при возникновении исключения внутри callback.
         try {
             $callback($this->router);
         } finally {
             $collector->resetGroupStackTo($stackSizeBefore);
         }
+    }
+
+    private static function normalizePrefix(string $prefix): string
+    {
+        $normalized = '/' . trim($prefix, '/');
+
+        return $normalized === '/' ? '' : $normalized;
     }
 }

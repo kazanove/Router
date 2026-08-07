@@ -4,139 +4,259 @@ declare(strict_types=1);
 namespace CodeX\Router;
 
 use CodeX\Exception\Router;
+use CodeX\Router\Middleware\Definition;
 use ValueError;
 
-class Node
+/**
+ * Узел дерева маршрутов.
+ *
+ * Поддерживает:
+ * - статические сегменты;
+ * - параметры;
+ * - необязательные параметры;
+ * - catch-all-параметры;
+ * - псевдонимы типов: int, float, slug, uuid, catchall.
+ */
+final class Node
 {
-    public array $children = [];
+    /**
+     * Псевдонимы типов параметров.
+     */
+    private const array TYPE_ALIASES = [
+        'int' => '\d+',
+        'float' => '\d+(?:\.\d+)?',
+        'slug' => '[a-zA-Z0-9_-]+',
+        'uuid' => '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',
+        'catchall' => '.*',
+    ];
+
+    /**
+     * Статические дочерние узлы.
+     *
+     * @var array<string, Node>
+     */
+    private array $staticChildren = [];
+
+    /**
+     * Все дочерние узлы, включая параметры и catch-all.
+     * Используется преимущественно для отладки и обхода дерева.
+     *
+     * @var array<string, Node>
+     */
+    private array $allChildren = [];
+
+    private ?Node $parameterChild = null;
+    private ?Node $catchAllChild = null;
+
     public ?string $paramName = null;
     public bool $isParameter = false;
+    public bool $isOptional = false;
+    public bool $isCatchAll = false;
     public ?string $paramType = null;
-    private ?string $paramRegex = null;
-    private ?string $nameValue = null;
+
+    /**
+     * Скомпилированное регулярное выражение параметра.
+     * Кэшируется один раз в конструкторе.
+     */
+    private string $pattern;
+
+    /**
+     * Обработчики по HTTP-методам.
+     *
+     * @var array<string, array{
+     *     handler: mixed,
+     *     middleware: array<int, Definition>,
+     *     name: string|null
+     * }>
+     */
     private array $handlers = [];
 
     /**
-     * Конструктор с использованием Asymmetric Visibility (PHP 8.4).
-     * Свойство $segment доступно для чтения извне (public),
-     * но защищено от изменения извне (private(set)).
+     * Полный путь маршрута, к которому относится узел.
      */
-    public function __construct( private(set) readonly ?string $segment = null)
-    {
-        // Проверка сегмента на наличие параметра (например, {id:\d+})
-        if ($segment !== null && preg_match('/^{([a-zA-Z_]\w*)(?::([^}]+))?}$/', $segment, $matches)) {
-            $this->isParameter = true;
-            $this->paramName = $matches[1];
-            $this->paramRegex = $matches[2] ?? '[^/]+';
+    private ?string $path = null;
 
-            // Fail-Fast валидация: проверяем корректность регулярного выражения сразу при создании узла
-            $testPattern = '~^' . str_replace('~', '\~', $this->paramRegex) . '$~';
-
-            try {
-                preg_match($testPattern, 'test');
-            } catch (ValueError $e) {
-                throw Router::invalidRegex($this->paramName, $e->getMessage());
-            }
-
-            $this->paramType = $this->detectParamType($this->paramRegex);
-        }
-    }
-
-    /**
-     * Эвристика для определения типа параметра на основе его регулярного выражения.
-     * Позволяет Matcher'у автоматически приводить типы (кастинг).
-     */
-    private function detectParamType(string $regex): string
-    {
-        if ($regex === '\d+' || $regex === '[0-9]+') {
-            return 'int';
-        }
-        if ($regex === '\d+\.\d+' || $regex === '[0-9]+\.[0-9]+') {
-            return 'float';
-        }
-        return 'string';
-    }
-
-    public function getName(): ?string
-    {
-        return $this->nameValue;
-    }
-
-    public function setName(string $name): void
-    {
-        $this->nameValue = $name;
-    }
-
-    public function matchParameter(string $value): bool
-    {
-        if (!$this->isParameter) {
-            return false;
+    public function __construct(
+        public readonly ?string $segment = null
+    ) {
+        if ($segment === null) {
+            return;
         }
 
-        $pattern = '~^' . str_replace('~', '\~', $this->paramRegex) . '$~';
+        $working = $segment;
+
+        // Поддержка необязательных параметров:
+        // {page?}
+        // {page:\d+?}
+        if (str_ends_with($working, '?}')) {
+            $this->isOptional = true;
+            $working = substr($working, 0, -2) . '}';
+        }
+
+        if (!preg_match('/^\{([a-zA-Z_]\w*)(?::([^}]+))?}$/', $working, $matches)) {
+            return;
+        }
+
+        $this->isParameter = true;
+        $this->paramName = $matches[1];
+
+        $regex = isset($matches[2]) ? trim($matches[2]) : null;
+
+        if ($regex !== null) {
+            $regex = self::TYPE_ALIASES[$regex] ?? $regex;
+        } else {
+            $regex = '[^/]+';
+        }
+
+        if ($regex === '.*') {
+            $this->isCatchAll = true;
+        }
+
+        $this->paramType = $this->detectParamType($regex);
+
+        $this->pattern = '~^' . str_replace('~', '\~', $regex) . '$~';
 
         try {
-            $result = preg_match($pattern, $value);
+            $test = @preg_match($this->pattern, 'test');
+
+            if ($test === false) {
+                throw Router::invalidRegex($this->paramName, 'некорректный шаблон');
+            }
         } catch (ValueError $e) {
-            throw Router::regexExecutionError($this->paramName, $e->getMessage());
+            throw Router::invalidRegex($this->paramName, $e->getMessage());
+        }
+    }
+
+    private function detectParamType(string $regex): string
+    {
+        if ($this->isCatchAll) {
+            return 'string';
         }
 
-        return $result === 1;
+        if (in_array($regex, ['\d+', '[0-9]+'], true)) {
+            return 'int';
+        }
+
+        if (in_array($regex, ['\d+\.\d+', '[0-9]+\.[0-9]+', '\d+(?:\.\d+)?'], true)) {
+            return 'float';
+        }
+
+        return 'string';
     }
 
     public function addChild(string $segment): self
     {
-        if (isset($this->children[$segment])) {
-            return $this->children[$segment];
+        if (isset($this->allChildren[$segment])) {
+            return $this->allChildren[$segment];
         }
 
         $child = new self($segment);
 
-        // Защита от двусмысленности: на одном уровне дерева не может быть двух разных параметров
-        if ($child->isParameter) {
-            foreach ($this->children as $existing) {
-                if ($existing->isParameter) {
-                    throw Router::parameterAlreadyExists($segment, $existing->segment ?? 'unknown');
-                }
+        if ($child->isCatchAll) {
+            if ($this->catchAllChild !== null || $this->parameterChild !== null) {
+                throw Router::parameterAlreadyExists(
+                    $segment,
+                    $this->catchAllChild?->segment ?? $this->parameterChild?->segment ?? 'unknown'
+                );
             }
+
+            $this->catchAllChild = $child;
+        } elseif ($child->isParameter) {
+            if ($this->parameterChild !== null || $this->catchAllChild !== null) {
+                throw Router::parameterAlreadyExists(
+                    $segment,
+                    $this->parameterChild?->segment ?? $this->catchAllChild?->segment ?? 'unknown'
+                );
+            }
+
+            $this->parameterChild = $child;
+        } else {
+            $this->staticChildren[$segment] = $child;
         }
 
-        $this->children[$segment] = $child;
+        $this->allChildren[$segment] = $child;
+
         return $child;
     }
 
     public function getChild(string $segment): ?self
     {
-        return $this->children[$segment] ?? null;
+        return $this->staticChildren[$segment] ?? null;
+    }
+
+    public function getParameterChild(): ?self
+    {
+        return $this->parameterChild;
+    }
+
+    public function getCatchAllChild(): ?self
+    {
+        return $this->catchAllChild;
+    }
+
+    public function getOptionalParameterChild(): ?self
+    {
+        if ($this->parameterChild !== null && $this->parameterChild->isOptional) {
+            return $this->parameterChild;
+        }
+
+        return null;
     }
 
     /**
-     * Использование нативной функции array_find (PHP 8.4) для поиска параметризованного потомка.
+     * @return array<string, Node>
      */
-    public function getParameterChild(): ?self
+    public function getChildren(): array
     {
-        return array_find($this->children, static fn($child) => $child->isParameter);
+        return $this->allChildren;
     }
 
-    public function addHandler(string $method, callable|array $handler, array $middleware = [], ?string $name = null): void
+    public function matchParameter(string $value): bool
     {
+        if (!$this->isParameter && !$this->isCatchAll) {
+            return false;
+        }
+
+        try {
+            $result = @preg_match($this->pattern, $value);
+
+            if ($result === false) {
+                throw Router::regexExecutionError($this->paramName ?? 'unknown', 'ошибка preg_match');
+            }
+        } catch (ValueError $e) {
+            throw Router::regexExecutionError($this->paramName ?? 'unknown', $e->getMessage());
+        }
+
+        return $result === 1;
+    }
+
+    public function setPath(string $path): void
+    {
+        if ($this->path === null) {
+            $this->path = $path;
+        }
+    }
+
+    public function getPath(): ?string
+    {
+        return $this->path;
+    }
+
+    public function addHandler(
+        string $method,
+        mixed $handler,
+        array $middleware = [],
+        ?string $name = null
+    ): void {
         $method = strtoupper($method);
+
         if (isset($this->handlers[$method])) {
             throw Router::handlerAlreadyExists($method);
         }
 
-        $normalizedMiddleware = [];
-        foreach ($middleware as $mw) {
-            if (is_array($mw) && isset($mw['class'])) {
-                $normalizedMiddleware[] = $mw;
-            } else {
-                $normalizedMiddleware[] = ['class' => $mw, 'params' => []];
-            }
-        }
-
         $this->handlers[$method] = [
             'handler' => $handler,
-            'middleware' => $normalizedMiddleware,
+            'middleware' => $middleware,
             'name' => $name,
         ];
     }
@@ -146,30 +266,43 @@ class Node
         return $this->handlers[strtoupper($method)] ?? null;
     }
 
+    public function hasHandler(string $method): bool
+    {
+        return isset($this->handlers[strtoupper($method)]);
+    }
+
+    public function hasAnyHandler(): bool
+    {
+        return $this->handlers !== [];
+    }
+
+    /**
+     * @return array<int, string>
+     */
     public function getMethods(): array
     {
         return array_keys($this->handlers);
     }
 
-    public function addMiddlewareToHandler(string $method, string|array|callable $middleware, array $params = []): void
+    public function addMiddlewareToHandler(string $method, Definition $middleware): void
     {
         $method = strtoupper($method);
+
         if (!isset($this->handlers[$method])) {
             throw Router::handlerNotFound($method);
         }
 
-        $items = is_array($middleware) ? $middleware : [$middleware];
-        foreach ($items as $item) {
-            $this->handlers[$method]['middleware'][] = ['class' => $item, 'params' => $params];
-        }
+        $this->handlers[$method]['middleware'][] = $middleware;
     }
 
     public function setNameForHandler(string $method, string $name): void
     {
         $method = strtoupper($method);
+
         if (!isset($this->handlers[$method])) {
             throw Router::handlerNotFound($method);
         }
+
         $this->handlers[$method]['name'] = $name;
     }
 }

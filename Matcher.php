@@ -3,64 +3,147 @@ declare(strict_types=1);
 
 namespace CodeX\Router;
 
+use CodeX\Router\Helper\Path;
 use CodeX\Router\Match\Result;
 
-class Matcher
+/**
+ * Сопоставитель запросов.
+ *
+ * Выполняет обход дерева маршрутов и возвращает Result.
+ */
+final readonly class Matcher
 {
-    private Node $root;
-
-    public function __construct(Node $root)
-    {
-        $this->root = $root;
+    public function __construct(
+        private Node $root
+    ) {
     }
 
-    public function match(string $method, string $path): Result
+    public function match(string $method, string $url): Result
     {
-        // Использование общего хелпера
-        $segments = PathHelper::parse($path);
+        $method = strtoupper($method);
+        $path = Path::fromUrl($url);
+        $segments = Path::parse($path);
+
         $params = [];
         $node = $this->root;
 
-        foreach ($segments as $segment) {
+        foreach ($segments as $i => $iValue) {
+            $segment = $iValue;
+
+            // Приоритет: статический сегмент.
             $next = $node->getChild($segment);
 
-            if ($next === null) {
-                $next = $node->getParameterChild();
-                if ($next === null) {
-                    return new Result(null, [], [], null);
-                }
-
-                if (!$next->matchParameter($segment)) {
-                    return new Result(null, [], [], null);
-                }
-
-                // Автоматический кастинг типов на основе эвристики узла
-                $value = $segment;
-                $paramType = $next->paramType;
-                if ($paramType === 'int') {
-                    $value = (int) $value;
-                } elseif ($paramType === 'float') {
-                    $value = (float) $value;
-                }
-                $params[$next->paramName] = $value;
+            if ($next !== null) {
+                $node = $next;
+                continue;
             }
 
-            $node = $next;
+            // Затем обычный параметр.
+            $parameterChild = $node->getParameterChild();
+
+            if (
+                $parameterChild !== null
+                && !$parameterChild->isCatchAll
+                && $parameterChild->matchParameter($segment)
+            ) {
+                $params[$parameterChild->paramName] = $this->castParameter($parameterChild, $segment);
+                $node = $parameterChild;
+                continue;
+            }
+
+            // Затем catch-all-параметр, который забирает остаток пути.
+            $catchAllChild = $node->getCatchAllChild();
+
+            if ($catchAllChild !== null) {
+                $remaining = implode('/', array_slice($segments, $i));
+
+                if (($remaining !== '' || $catchAllChild->isOptional) && $catchAllChild->matchParameter($remaining)) {
+                    $params[$catchAllChild->paramName] = rawurldecode($remaining);
+                    $node = $catchAllChild;
+                    break;
+                }
+            }
+
+            return Result::notFound();
+        }
+
+        // Если после обхода остался необязательный catch-all,
+        // который может совпасть с пустой строкой.
+        $catchAllChild = $node->getCatchAllChild();
+
+        if ($catchAllChild !== null && $catchAllChild->isOptional && $catchAllChild->matchParameter('')) {
+            if (
+                !$this->hasMethod($node, $method)
+                && $this->hasMethod($catchAllChild, $method)
+            ) {
+                $params[$catchAllChild->paramName] = '';
+                $node = $catchAllChild;
+            } elseif (!$node->hasAnyHandler() && $catchAllChild->hasAnyHandler()) {
+                $params[$catchAllChild->paramName] = '';
+                $node = $catchAllChild;
+            }
+        }
+
+        // Если остался необязательный параметр, который может совпасть
+        // с отсутствующим сегментом.
+        $optionalChild = $node->getOptionalParameterChild();
+
+        if ($optionalChild !== null) {
+            if (
+                !$this->hasMethod($node, $method)
+                && $this->hasMethod($optionalChild, $method)
+            ) {
+                $node = $optionalChild;
+            } elseif (!$node->hasAnyHandler() && $optionalChild->hasAnyHandler()) {
+                $node = $optionalChild;
+            }
         }
 
         $handlerData = $node->getHandler($method);
 
+        // Поддержка HEAD: если нет отдельного HEAD-обработчика,
+        // используется GET-обработчик.
+        if ($handlerData === null && $method === 'HEAD') {
+            $handlerData = $node->getHandler('GET');
+        }
+
         if ($handlerData !== null) {
-            return new Result(
+            return Result::found(
                 $handlerData['handler'],
                 $handlerData['middleware'],
                 $params,
-                $handlerData['name']
+                $handlerData['name'],
+                $node->getPath()
             );
         }
 
-        // Если узел найден, но метод не совпал, возвращаем разрешенные методы для 405 ответа
         $allowedMethods = $node->getMethods();
-        return new Result(null, [], $params, null, $allowedMethods);
+
+        if (in_array('GET', $allowedMethods, true) && !in_array('HEAD', $allowedMethods, true)) {
+            $allowedMethods[] = 'HEAD';
+        }
+
+        if ($allowedMethods !== []) {
+            return Result::methodNotAllowed($allowedMethods, $params, $node->getPath());
+        }
+
+        return Result::notFound();
+    }
+
+    private function hasMethod(Node $node, string $method): bool
+    {
+        return $node->hasHandler($method)
+            || ($method === 'HEAD' && $node->hasHandler('GET'));
+    }
+
+    private function castParameter(Node $node, string $rawValue): string|int|float
+    {
+        $value = rawurldecode($rawValue);
+
+        return match ($node->paramType) {
+            'int' => (int) $value,
+            'float' => (float) $value,
+            default => $value,
+        };
     }
 }

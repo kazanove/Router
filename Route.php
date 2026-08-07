@@ -4,12 +4,17 @@ declare(strict_types=1);
 namespace CodeX\Router;
 
 use CodeX\Exception\Router;
+use CodeX\Router\Helper\Path;
 use CodeX\Router\Match\Result;
 
-class Route
+/**
+ * Главная точка входа маршрутизатора.
+ */
+final class Route
 {
     /**
-     * Property Hook (PHP 8.4) для инкапсуляции инстанса коллектора.
+     * Property hook PHP 8.4:
+     * публичный доступ к коллектору только для чтения.
      */
     public Collector $collector {
         get => $this->collectorInstance;
@@ -17,14 +22,15 @@ class Route
 
     private Collector $collectorInstance;
     private ?Matcher $matcher = null;
-    private ?array $namedRoutes = null;
+    private Dispatcher $dispatcher;
 
-    public function __construct()
+    public function __construct(?object $container = null)
     {
         $this->collectorInstance = new Collector();
+        $this->dispatcher = new Dispatcher(new Resolver($container));
     }
 
-    public function middleware(string|array|callable $middleware): Group
+    public function middleware(mixed $middleware): Group
     {
         return new Group($this, $middleware, null);
     }
@@ -32,6 +38,11 @@ class Route
     public function prefix(string $prefix): Group
     {
         return new Group($this, null, $prefix);
+    }
+
+    public function namePrefix(string $namePrefix): Group
+    {
+        return new Group($this, null, null, $namePrefix);
     }
 
     public function get(string $path, callable|array|string $handler): Builder
@@ -69,81 +80,184 @@ class Route
         return $this->collectorInstance->addRoute('QUERY', $path, $handler);
     }
 
-    public function any(string $path, callable|array|string $handler, array $methods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'QUERY']): Builder
-    {
-        if (empty($methods)) {
+    public function any(
+        string $path,
+        callable|array|string $handler,
+        array $methods = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'QUERY']
+    ): Builder {
+        $methods = array_values(array_unique(array_map(
+            static fn (string $method): string => strtoupper($method),
+            $methods
+        )));
+
+        if ($methods === []) {
             throw Router::emptyMethods();
         }
 
         $node = null;
+
         foreach ($methods as $method) {
-            $b = $this->collectorInstance->addRoute($method, $path, $handler);
+            $builder = $this->collectorInstance->addRoute($method, $path, $handler);
+
             if ($node === null) {
-                $node = $b->getNode();
+                $node = $builder->getNode();
             }
         }
 
-        return new Builder($node, $methods);
+        return new Builder($node, $methods, $this->collectorInstance);
     }
 
     /**
-     * Диспетчеризация запроса. Lazy Initialization: Matcher создается только при первом вызове.
+     * Сопоставляет запрос с маршрутом.
      */
     public function handle(string $method, string $url): Result
     {
         if ($this->matcher === null) {
             $this->matcher = new Matcher($this->collectorInstance->root);
         }
+
         return $this->matcher->match($method, $url);
     }
 
     /**
-     * Обратная маршрутизация (Reverse Routing): генерация URL по имени маршрута.
+     * Сопоставляет запрос и сразу выполняет middleware и обработчик.
      */
-    public function url(string $name, array $params = []): string
+    public function dispatch(string $method, string $url, mixed $request = null): mixed
     {
-        if ($this->namedRoutes === null) {
-            $this->buildNamedRoutesMap();
-        }
+        $result = $this->handle($method, $url);
 
-        if (!isset($this->namedRoutes[$name])) {
-            throw Router::routeNotFound($name);
-        }
+        return $this->dispatcher->dispatch($result, $request);
+    }
 
-        $pattern = $this->namedRoutes[$name];
+    /**
+     * Генерация URL по имени маршрута.
+     *
+     * Поддерживает:
+     * - обязательные параметры;
+     * - необязательные параметры;
+     * - catch-all-параметры;
+     * - query-параметры;
+     * - фрагмент;
+     * - строгий режим неиспользованных параметров.
+     *
+     * @param array<string, mixed> $params
+     * @param array<string, mixed> $query
+     */
+    public function url(
+        string $name,
+        array $params = [],
+        array $query = [],
+        ?string $fragment = null,
+        bool $strict = false
+    ): string {
+        $pattern = $this->collectorInstance->getNamedRoute($name);
+        $segments = Path::parse($pattern);
 
-        return preg_replace_callback('/\{([a-zA-Z_]\w*)(?::[^}]*)?}/', static function ($matches) use ($params, $name) {
-            $paramName = $matches[1];
-            if (!array_key_exists($paramName, $params)) {
+        $parts = [];
+        $used = [];
+
+        foreach ($segments as $segment) {
+            $info = $this->parseParameterSegment($segment);
+
+            if ($info === null) {
+                $parts[] = $segment;
+                continue;
+            }
+
+            $paramName = $info['name'];
+
+            if (array_key_exists($paramName, $params)) {
+                $value = $params[$paramName];
+
+                if ($value === null) {
+                    if ($info['optional']) {
+                        continue;
+                    }
+
+                    throw Router::routeParamMissing($paramName, $name);
+                }
+
+                $used[] = $paramName;
+
+                if ($info['catchall']) {
+                    $encoded = implode('/', array_map(
+                        'rawurlencode',
+                        explode('/', (string) $value)
+                    ));
+                } else {
+                    $encoded = rawurlencode((string) $value);
+                }
+
+                $parts[] = $encoded;
+
+                continue;
+            }
+
+            if (!$info['optional']) {
                 throw Router::routeParamMissing($paramName, $name);
             }
-            return rawurlencode((string)$params[$paramName]);
-        }, $pattern);
+        }
+
+        $path = '/' . implode('/', $parts);
+
+        if ($path !== '/') {
+            $path = rtrim($path, '/');
+        }
+
+        $unused = array_diff_key($params, array_flip($used));
+
+        if ($strict && $unused !== []) {
+            throw Router::unusedRouteParams(array_keys($unused));
+        }
+
+        if ($unused !== []) {
+            $query = array_merge($query, $unused);
+        }
+
+        if ($query !== []) {
+            $path .= '?' . http_build_query($query);
+        }
+
+        if ($fragment !== null && $fragment !== '') {
+            $path .= '#' . rawurlencode($fragment);
+        }
+
+        return $path;
     }
 
-    private function buildNamedRoutesMap(): void
+    /**
+     * @return array<string, string>
+     */
+    public function getNamedRoutes(): array
     {
-        $this->namedRoutes = [];
-        $this->collectNamedRoutes($this->collectorInstance->root, '');
+        return $this->collectorInstance->getNamedRoutes();
     }
 
-    private function collectNamedRoutes(Node $node, string $currentPath): void
+    /**
+     * Разбирает сегмент маршрута для генерации URL.
+     *
+     * @return array{name: string, optional: bool, catchall: bool}|null
+     */
+    private function parseParameterSegment(string $segment): ?array
     {
-        $pathSegment = $node->paramName ? '{' . $node->paramName . '}' : $node->segment;
-        if ($pathSegment !== null) {
-            $currentPath .= '/' . $pathSegment;
+        $optional = false;
+
+        if (str_ends_with($segment, '?}')) {
+            $optional = true;
+            $segment = substr($segment, 0, -2) . '}';
         }
 
-        // ИСПРАВЛЕНИЕ: Добавлен метод 'QUERY' для корректного маппинга именованных маршрутов.
-        foreach (['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'QUERY'] as $method) {
-            $handlerData = $node->getHandler($method);
-            if ($handlerData !== null && $handlerData['name'] !== null) {
-                $this->namedRoutes[$handlerData['name']] = $currentPath !== '' ? $currentPath : '/';
-            }
+        if (!preg_match('/^\{([a-zA-Z_]\w*)(?::([^}]+))?}$/', $segment, $matches)) {
+            return null;
         }
 
-        foreach ($node->children as $child) {
-            $this->collectNamedRoutes($child, $currentPath);
-        }
+        $regex = isset($matches[2]) ? trim($matches[2]) : null;
+        $catchAll = in_array($regex, ['.*', 'catchall'], true);
+
+        return [
+            'name' => $matches[1],
+            'optional' => $optional,
+            'catchall' => $catchAll,
+        ];
     }
 }
