@@ -1,4 +1,5 @@
 <?php
+
 declare(strict_types=1);
 
 namespace CodeX\Router;
@@ -29,6 +30,29 @@ final class Route
         $this->collectorInstance = new Collector();
         $this->dispatcher = new Dispatcher(new Resolver($container));
     }
+
+    // ============================================
+    // НОВЫЙ МЕТОД: group()
+    // ============================================
+
+    /**
+     * Создаёт группу маршрутов без префикса и middleware.
+     *
+     * Позволяет группировать маршруты без дополнительных параметров:
+     *
+     * route()->group(function (Route $router) {
+     *     $router->get('/dashboard', [DashboardController::class, 'index']);
+     * });
+     */
+    public function group(callable $callback): void
+    {
+        $group = new Group($this, null, null);
+        $group->group($callback);
+    }
+
+    // ============================================
+    // СУЩЕСТВУЮЩИЕ МЕТОДЫ
+    // ============================================
 
     public function middleware(mixed $middleware): Group
     {
@@ -131,14 +155,6 @@ final class Route
 
     /**
      * Генерация URL по имени маршрута.
-     *
-     * Поддерживает:
-     * - обязательные параметры;
-     * - необязательные параметры;
-     * - catch-all-параметры;
-     * - query-параметры;
-     * - фрагмент;
-     * - строгий режим неиспользованных параметров.
      *
      * @param array<string, mixed> $params
      * @param array<string, mixed> $query
