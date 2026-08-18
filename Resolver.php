@@ -151,13 +151,9 @@ final readonly class Resolver
 
     private function instantiate(string $class): object
     {
-        if (
-            $this->container !== null
-            && method_exists($this->container, 'has')
-            && method_exists($this->container, 'get')
-            && $this->container->has($class)
-        ) {
-            return $this->container->get($class);
+        // Используем make() для поддержки автоматического внедрения зависимостей (Auto-wiring)
+        if ($this->container !== null && method_exists($this->container, 'make')) {
+            return $this->container->make($class);
         }
 
         if (!class_exists($class)) {

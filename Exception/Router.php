@@ -3,6 +3,7 @@ declare(strict_types=1);
 
 namespace CodeX\Exception;
 
+use NoDiscard;
 use RuntimeException;
 
 /**
@@ -13,6 +14,7 @@ use RuntimeException;
  */
 final class Router extends RuntimeException
 {
+    #[NoDiscard] 
     public static function emptyMethods(): self
     {
         return new self('Список HTTP-методов не может быть пустым.');
@@ -20,7 +22,7 @@ final class Router extends RuntimeException
 
     public static function invalidMethod(string $method): self
     {
-        return new self(sprintf('Недопустимый HTTP-метод: "%s".', $method));
+        return new self('Недопустимый HTTP-метод: ' . $method . '.');
     }
 
     public static function invalidRegex(string $param, string $error): self
