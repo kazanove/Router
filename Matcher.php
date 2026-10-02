@@ -27,10 +27,8 @@ final readonly class Matcher
         $params = [];
         $node = $this->root;
 
-        foreach ($segments as $i => $iValue) {
-            $segment = $iValue;
+        foreach ($segments as $i => $segment) {
 
-            // Приоритет: статический сегмент.
             $next = $node->getChild($segment);
 
             if ($next !== null) {

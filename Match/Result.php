@@ -8,8 +8,15 @@ namespace CodeX\Router\Match;
  */
 final readonly class Result
 {
-    public function __construct(public Status $status, public mixed $handler = null, public array $middleware = [], public array $params = [], public ?string $name = null, public array $allowedMethods = [], public ?string $matchedPath = null)
-    {
+    public function __construct(
+        public Status $status,
+        public mixed $handler = null,
+        public array $middleware = [],
+        public array $params = [],
+        public ?string $name = null,
+        public array $allowedMethods = [],
+        public ?string $matchedPath = null
+    ) {
     }
 
     public static function found(mixed $handler, array $middleware, array $params, ?string $name, ?string $matchedPath): self

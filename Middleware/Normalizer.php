@@ -1,10 +1,12 @@
 <?php
 
+declare(strict_types=1);
+
 namespace CodeX\Router\Middleware;
 
 use Closure;
+use CodeX\Contract\Router\Middleware;
 use CodeX\Exception\Router;
-use CodeX\Router\Contract\Middleware;
 
 /**
  * Нормализатор middleware.
@@ -44,7 +46,6 @@ final class Normalizer
             if (isset($middleware['handler']) || isset($middleware['class'])) {
                 $handler = $middleware['handler'] ?? $middleware['class'];
                 $params = $middleware['params'] ?? $defaultParams;
-
                 return [new Definition($handler, (array) $params)];
             }
 
@@ -58,14 +59,12 @@ final class Normalizer
                 return [new Definition($middleware, $defaultParams)];
             }
 
-            // Список middleware (Рекурсивный обход).
+            // Список middleware (рекурсивный обход).
             if (array_is_list($middleware)) {
                 $result = [];
-
                 foreach ($middleware as $item) {
                     array_push($result, ...self::normalize($item, $defaultParams));
                 }
-
                 return $result;
             }
         }

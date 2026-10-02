@@ -1,7 +1,7 @@
 <?php
 declare(strict_types=1);
 
-namespace CodeX\Router\Contract;
+namespace CodeX\Contract\Router;
 /**
  * Контракт для middleware, если используется объектно-ориентированный стиль.
  */

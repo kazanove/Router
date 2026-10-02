@@ -29,19 +29,16 @@ final class Node
         'uuid' => '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}',
         'catchall' => '.*',
     ];
+    private const int MAX_PATTERN_LENGTH = 256;
 
     /**
      * Статические дочерние узлы.
-     *
-     * @var array<string, Node>
      */
     private array $staticChildren = [];
 
     /**
      * Все дочерние узлы, включая параметры и catch-all.
      * Используется преимущественно для отладки и обхода дерева.
-     *
-     * @var array<string, Node>
      */
     private array $allChildren = [];
 
@@ -85,9 +82,6 @@ final class Node
 
         $working = $segment;
 
-        // Поддержка необязательных параметров:
-        // {page?}
-        // {page:\d+?}
         if (str_ends_with($working, '?}')) {
             $this->isOptional = true;
             $working = substr($working, 0, -2) . '}';
@@ -99,7 +93,6 @@ final class Node
 
         $this->isParameter = true;
         $this->paramName = $matches[1];
-
         $regex = isset($matches[2]) ? trim($matches[2]) : null;
 
         if ($regex !== null) {
@@ -108,17 +101,23 @@ final class Node
             $regex = '[^/]+';
         }
 
+        // ИСПРАВЛЕНО: защита от ReDoS — ограничение длины паттерна
+        if (strlen($regex) > self::MAX_PATTERN_LENGTH) {
+            throw Router::invalidRegex(
+                $this->paramName,
+                'Паттерн превышает максимальную длину ' . self::MAX_PATTERN_LENGTH . ' символов'
+            );
+        }
+
         if ($regex === '.*') {
             $this->isCatchAll = true;
         }
 
         $this->paramType = $this->detectParamType($regex);
-
         $this->pattern = '~^' . str_replace('~', '\~', $regex) . '$~';
 
         try {
             $test = @preg_match($this->pattern, 'test');
-
             if ($test === false) {
                 throw Router::invalidRegex($this->paramName, 'некорректный шаблон');
             }
